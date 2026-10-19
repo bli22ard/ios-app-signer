@@ -32,6 +32,7 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     //MARK: Variables
     var provisioningProfiles:[ProvisioningProfile] = []
     @objc var codesigningCerts: [String] = []
+    var codesigningCertHashes: [String: String] = [:]
     @objc var profileFilename: String?
     @objc var ReEnableNewApplicationID = false
     @objc var PreviousNewApplicationID = ""
@@ -258,18 +259,39 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
     
     @objc func getCodesigningCerts() -> [String] {
         var output: [String] = []
+        var hashes: [String: String] = [:]
         let securityResult = Process().execute(securityPath, workingDirectory: nil, arguments: ["find-identity","-v","-p","appleID"])
         if securityResult.output.count < 1 {
+            codesigningCertHashes = hashes
             return output
         }
-        let rawResult = securityResult.output.components(separatedBy: "\"")
-        
-        for index in stride(from: 0, through: rawResult.count - 2, by: 2) {
-            if !(rawResult.count - 1 < index + 1) {
-                output.append(rawResult[index+1])
+        for line in securityResult.output.components(separatedBy: "\n") {
+            guard let quoteStart = line.firstIndex(of: "\""),
+                  let quoteEnd = line.lastIndex(of: "\""),
+                  quoteStart < quoteEnd else {
+                continue
             }
+            let name = String(line[line.index(after: quoteStart)..<quoteEnd])
+            if name.isEmpty || hashes[name] != nil {
+                continue
+            }
+            let prefix = line[..<quoteStart]
+            guard let hashToken = prefix.split(separator: " ").last else {
+                continue
+            }
+            let hash = String(hashToken)
+            guard hash.count == 40, hash.allSatisfy({ $0.isHexDigit }) else {
+                continue
+            }
+            hashes[name] = hash.uppercased()
+            output.append(name)
         }
+        codesigningCertHashes = hashes
         return output.sorted()
+    }
+
+    func signingIdentity(for certificate: String) -> String {
+        return codesigningCertHashes[certificate] ?? certificate
     }
     
     @objc func showCodesignCertsErrorAlert(){
@@ -512,7 +534,9 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
             beforeFunc(file, certificate, entitlements)
         }
 
-        var arguments = ["-f", "-s", certificate, "--generate-entitlement-der"]
+        // codesign throws "unknown exception" when the identity name contains non-ASCII characters.
+        let identity = signingIdentity(for: certificate)
+        var arguments = ["-f", "-s", identity, "--generate-entitlement-der"]
         if needEntitlements {
             arguments += ["--entitlements", entitlements!]
         }
@@ -655,6 +679,10 @@ class MainView: NSView, URLSessionDataDelegate, URLSessionDelegate, URLSessionDo
         //MARK: Codesign Test
         
         DispatchQueue.main.async(execute: {
+            let identity = self.signingIdentity(for: signingCertificate!)
+            if identity != signingCertificate {
+                Log.write("Signing with certificate hash \(identity) for \"\(signingCertificate!)\"")
+            }
             if let codesignResult = self.testSigning(signingCertificate!, tempFolder: tempFolder) {
                 if codesignResult == false {
                     let alert = NSAlert()
